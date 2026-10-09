@@ -14,6 +14,7 @@
 	import { getUserVariables, updateUserVariables } from '$lib/apis/users';
 
 	import UpdatePassword from './Account/UpdatePassword.svelte';
+	import Mfa from './Account/Mfa.svelte';
 	import { generateInitialsImage } from '$lib/utils';
 	import { copyToClipboard } from '$lib/utils';
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
@@ -384,6 +385,8 @@
 			</UserSettingSection>
 		{/if}
 
+		<UserSettingSection title={$i18n.t('Multi-factor authentication')}><Mfa /></UserSettingSection>
+
 		{#if canUseApiKeys({ user: $user, config: $config })}
 			<UserSettingSection title={$i18n.t('settings.personal.account.sections.apiKeys.title')}>
 				<UserSettingRow description={$i18n.t('settings.personal.account.secrets.description')}>
@@ -408,6 +411,7 @@
 									<SensitiveInput variant="settings" value={localStorage.token} readOnly={true} />
 
 									<button
+										type="button"
 										class="ml-1.5 rounded-sm px-1.5 py-1 text-gray-500 transition hover:text-gray-700 dark:hover:text-gray-300"
 										aria-label={$i18n.t('Copy Token')}
 										on:click={() => {
@@ -465,6 +469,7 @@
 										<SensitiveInput variant="settings" value={APIKey} readOnly={true} />
 
 										<button
+											type="button"
 											class="ml-1.5 rounded-sm px-1.5 py-1 text-gray-500 transition hover:text-gray-700 dark:hover:text-gray-300"
 											aria-label={$i18n.t('Copy API Key')}
 											on:click={() => {

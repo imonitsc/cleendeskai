@@ -1,20 +1,30 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
+	import { beforeNavigate, goto } from '$app/navigation';
+	import { getModels } from '$lib/apis';
+	import ModelHistory from './ModelHistory.svelte';
+	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 
 	import { onMount, onDestroy, getContext, tick } from 'svelte';
-	import { models, tools, functions, user } from '$lib/stores';
-	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, DEFAULT_CAPABILITIES } from '$lib/constants';
+	import { config, models, tools, functions, user, settings } from '$lib/stores';
+	import { WEBUI_BASE_URL, DEFAULT_CAPABILITIES } from '$lib/constants';
 
 	import { getTools } from '$lib/apis/tools';
 	import { getSkills } from '$lib/apis/skills';
 	import { getFunctions } from '$lib/apis/functions';
 	import { getModelsDefaults } from '$lib/apis/configs';
 	import { getLanguages } from '$lib/i18n';
-	import { getBaseModelTags, getModelTags } from '$lib/apis/models';
+	import {
+		getBaseModelTags,
+		getModelTags,
+		type ModelHistoryEntry,
+		type ModelSnapshot
+	} from '$lib/apis/models';
 	import { getVoices } from '$lib/apis/audio';
 	import { uploadFile, deleteFileById } from '$lib/apis/files';
 
 	import AdvancedParams from '$lib/components/chat/Settings/Advanced/AdvancedParams.svelte';
+	import ModelControls from '$lib/components/admin/Settings/Models/ModelControls.svelte';
 	import ModelSelector from '$lib/components/chat/ModelSelector/Selector.svelte';
 	import Tags from '$lib/components/common/Tags.svelte';
 	import Knowledge from '$lib/components/workspace/Models/Knowledge.svelte';
@@ -35,22 +45,66 @@
 	import PromptSuggestions from './PromptSuggestions.svelte';
 	import TerminalSelector from './TerminalSelector.svelte';
 	import TTSVoiceInput from './TTSVoiceInput.svelte';
+	import VoiceAvatarSettings from './VoiceAvatarSettings.svelte';
+	import {
+		avatarAssetIds,
+		type AnimationFiles,
+		type VoiceAvatarConfig
+	} from '$lib/utils/voice-avatar';
 	import AccessControlModal from '../common/AccessControlModal.svelte';
 	import AccessButton from '$lib/components/common/AccessButton.svelte';
-	import { extractInputVariables } from '$lib/utils';
+	import { copyToClipboard, extractInputVariables } from '$lib/utils';
 	import { pruneEmptyLocaleEntries } from '$lib/utils/localizedContent';
 
 	const i18n: any = getContext('i18n');
 
-	export let onSubmit: Function;
+	export let onSubmit: Function = () => {};
+	export let readOnly = false;
 	export let onBack: null | Function = null;
 
-	export let model = null;
+	export let model: any = null;
 	export let edit = false;
+	export let admin = false;
 
 	export let preset = true;
 
 	let loading = false;
+	let historyMenu: ModelHistory;
+	let selectedVersion: (ModelHistoryEntry & { snapshot: ModelSnapshot }) | null = null;
+	let selectingVersion = false;
+	let promotingVersion = false;
+	$: historical = !!selectedVersion || selectingVersion;
+	let commitMessage = '';
+	let savedDraft = '';
+	let defaultMeta: Record<string, any> = {};
+	let allowNavigation = false;
+	let showDiscard = false;
+	let afterDiscard: (() => void) | null = null;
+	$: configurationChanged =
+		!!savedDraft &&
+		(JSON.stringify(modelInfo) !== savedDraft ||
+			!!backgroundFile ||
+			!!avatarFile ||
+			Object.keys(animationFiles).length > 0);
+	$: dirty = configurationChanged || (!!savedDraft && !!commitMessage);
+	const discardThen = (action: () => void) => {
+		if (!dirty) return action();
+		afterDiscard = action;
+		showDiscard = true;
+	};
+	beforeNavigate(({ cancel, to, willUnload }) => {
+		if (readOnly || !dirty || allowNavigation) return;
+		cancel();
+		if (!willUnload && to)
+			discardThen(() => {
+				allowNavigation = true;
+				goto(to.url.href);
+			});
+	});
+
+	let voiceAvatar: VoiceAvatarConfig | null = null;
+	let avatarFile: File | null = null;
+	let animationFiles: AnimationFiles = {};
 	let backgroundFile: File | null = null;
 	let backgroundInput: HTMLInputElement;
 	let backgroundPreview: string | null = null;
@@ -101,6 +155,8 @@
 			// https://docs.openwebui.com/license.
 			profile_image_url: `${WEBUI_BASE_URL}/static/favicon.png`,
 			background_image_url: null as string | null,
+			voice: undefined as { voice?: string } | undefined,
+			voice_avatar: null as VoiceAvatarConfig | null,
 			description: '',
 			i18n: {},
 			suggestion_prompts: null,
@@ -111,7 +167,7 @@
 		}
 	};
 
-	let params = {
+	let params: Record<string, any> = {
 		system: ''
 	};
 
@@ -131,6 +187,7 @@
 	let accessGrants = [];
 	let terminalId = '';
 	let tts = { voice: '' };
+	let voice = { voice: '' };
 	export let suggestionTags: { name: string }[] = [];
 	let voices: { id: string; name?: string }[] = [];
 
@@ -280,12 +337,143 @@
 		);
 	};
 
-	const submitHandler = async () => {
-		if (loading) return;
-		loading = true;
+	$: modelInfo = (() => {
+		const modelInfo = structuredClone(info);
 
-		info.id = id;
-		info.name = name;
+		modelInfo.id = id;
+		modelInfo.meta.voice_avatar = voiceAvatar;
+		modelInfo.name = name;
+
+		modelInfo.params = { ...modelInfo.params, ...params };
+
+		modelInfo.access_grants = accessGrants;
+		modelInfo.meta.capabilities = capabilities;
+
+		if (enableDescription) {
+			modelInfo.meta.description =
+				(modelInfo.meta.description ?? '').trim() === '' ? null : modelInfo.meta.description;
+		} else {
+			modelInfo.meta.description = null;
+		}
+
+		if (knowledge.length > 0) {
+			modelInfo.meta.knowledge = knowledge.map(toModelKnowledgeReference);
+		} else {
+			if (modelInfo.meta.knowledge) {
+				delete modelInfo.meta.knowledge;
+			}
+		}
+
+		if (toolIds.length > 0) {
+			modelInfo.meta.toolIds = toolIds;
+		} else {
+			if (modelInfo.meta.toolIds) {
+				delete modelInfo.meta.toolIds;
+			}
+		}
+
+		if (skillIds.length > 0) {
+			modelInfo.meta.skillIds = skillIds;
+		} else {
+			if (modelInfo.meta.skillIds) {
+				delete modelInfo.meta.skillIds;
+			}
+		}
+
+		if (filterIds.length > 0) {
+			modelInfo.meta.filterIds = filterIds;
+		} else {
+			if (modelInfo.meta.filterIds) {
+				delete modelInfo.meta.filterIds;
+			}
+		}
+
+		if (defaultFilterIds.length > 0) {
+			modelInfo.meta.defaultFilterIds = defaultFilterIds;
+		} else {
+			if (modelInfo.meta.defaultFilterIds) {
+				delete modelInfo.meta.defaultFilterIds;
+			}
+		}
+
+		if (actionIds.length > 0) {
+			modelInfo.meta.actionIds = actionIds;
+		} else {
+			if (modelInfo.meta.actionIds) {
+				delete modelInfo.meta.actionIds;
+			}
+		}
+
+		if (defaultFeatureIds.length > 0) {
+			modelInfo.meta.defaultFeatureIds = defaultFeatureIds;
+		} else {
+			if (modelInfo.meta.defaultFeatureIds) {
+				delete modelInfo.meta.defaultFeatureIds;
+			}
+		}
+
+		if (Object.keys(builtinTools).length > 0) {
+			modelInfo.meta.builtinTools = builtinTools;
+		} else {
+			if (modelInfo.meta.builtinTools) {
+				delete modelInfo.meta.builtinTools;
+			}
+		}
+
+		modelInfo.meta.i18n = pruneEmptyLocaleEntries(modelInfo.meta.i18n);
+		if (Object.keys(modelInfo.meta.i18n).length === 0) {
+			delete modelInfo.meta.i18n;
+		}
+
+		if (terminalId) {
+			modelInfo.meta.terminalId = terminalId;
+		} else {
+			if (modelInfo.meta.terminalId) {
+				delete modelInfo.meta.terminalId;
+			}
+		}
+
+		if (voice.voice.trim()) modelInfo.meta.voice = { voice: voice.voice.trim() };
+		else delete modelInfo.meta.voice;
+
+		if (tts.voice !== '') {
+			if (!modelInfo.meta.tts) modelInfo.meta.tts = {};
+			modelInfo.meta.tts.voice = tts.voice;
+		} else {
+			if (modelInfo.meta.tts?.voice) {
+				delete modelInfo.meta.tts.voice;
+				if (Object.keys(modelInfo.meta.tts).length === 0) {
+					delete modelInfo.meta.tts;
+				}
+			}
+		}
+
+		modelInfo.params.system = system.trim() === '' ? null : system;
+		modelInfo.params.stop = params.stop
+			? (typeof params.stop === 'string' ? params.stop.split(',') : params.stop).filter((s) =>
+					s.trim()
+				)
+			: null;
+		Object.keys(modelInfo.params).forEach((key) => {
+			if (modelInfo.params[key] === '' || modelInfo.params[key] === null) {
+				delete modelInfo.params[key];
+			}
+		});
+
+		return modelInfo;
+	})();
+
+	const preventReadOnlyEdit = (event: Event) => {
+		if (readOnly && event.target instanceof Element && event.target.closest('fieldset:disabled')) {
+			if (event instanceof KeyboardEvent && event.key === 'Tab') return;
+			event.preventDefault();
+			event.stopPropagation();
+		}
+	};
+
+	const submitHandler = async () => {
+		if (readOnly || loading || historical || (edit && !configurationChanged)) return;
+		loading = true;
 
 		if (id === '') {
 			toast.error($i18n.t('Model ID is required.'));
@@ -322,121 +510,13 @@
 			return;
 		}
 
-		info.params = { ...info.params, ...params };
+		info = structuredClone(modelInfo);
 
-		info.access_grants = accessGrants;
-		info.meta.capabilities = capabilities;
-
-		if (enableDescription) {
-			info.meta.description =
-				(info.meta.description ?? '').trim() === '' ? null : info.meta.description;
-		} else {
-			info.meta.description = null;
-		}
-
-		if (knowledge.length > 0) {
-			info.meta.knowledge = knowledge.map(toModelKnowledgeReference);
-		} else {
-			if (info.meta.knowledge) {
-				delete info.meta.knowledge;
-			}
-		}
-
-		if (toolIds.length > 0) {
-			info.meta.toolIds = toolIds;
-		} else {
-			if (info.meta.toolIds) {
-				delete info.meta.toolIds;
-			}
-		}
-
-		if (skillIds.length > 0) {
-			info.meta.skillIds = skillIds;
-		} else {
-			if (info.meta.skillIds) {
-				delete info.meta.skillIds;
-			}
-		}
-
-		if (filterIds.length > 0) {
-			info.meta.filterIds = filterIds;
-		} else {
-			if (info.meta.filterIds) {
-				delete info.meta.filterIds;
-			}
-		}
-
-		if (defaultFilterIds.length > 0) {
-			info.meta.defaultFilterIds = defaultFilterIds;
-		} else {
-			if (info.meta.defaultFilterIds) {
-				delete info.meta.defaultFilterIds;
-			}
-		}
-
-		if (actionIds.length > 0) {
-			info.meta.actionIds = actionIds;
-		} else {
-			if (info.meta.actionIds) {
-				delete info.meta.actionIds;
-			}
-		}
-
-		if (defaultFeatureIds.length > 0) {
-			info.meta.defaultFeatureIds = defaultFeatureIds;
-		} else {
-			if (info.meta.defaultFeatureIds) {
-				delete info.meta.defaultFeatureIds;
-			}
-		}
-
-		if (Object.keys(builtinTools).length > 0) {
-			info.meta.builtinTools = builtinTools;
-		} else {
-			if (info.meta.builtinTools) {
-				delete info.meta.builtinTools;
-			}
-		}
-
-		info.meta.i18n = pruneEmptyLocaleEntries(info.meta.i18n);
-		if (Object.keys(info.meta.i18n).length === 0) {
-			delete info.meta.i18n;
-		}
-
-		if (terminalId) {
-			info.meta.terminalId = terminalId;
-		} else {
-			if (info.meta.terminalId) {
-				delete info.meta.terminalId;
-			}
-		}
-
-		if (tts.voice !== '') {
-			if (!info.meta.tts) info.meta.tts = {};
-			info.meta.tts.voice = tts.voice;
-		} else {
-			if (info.meta.tts?.voice) {
-				delete info.meta.tts.voice;
-				if (Object.keys(info.meta.tts).length === 0) {
-					delete info.meta.tts;
-				}
-			}
-		}
-
-		info.params.system = system.trim() === '' ? null : system;
-		info.params.stop = params.stop
-			? (typeof params.stop === 'string' ? params.stop.split(',') : params.stop).filter((s) =>
-					s.trim()
-				)
-			: null;
-		Object.keys(info.params).forEach((key) => {
-			if (info.params[key] === '' || info.params[key] === null) {
-				delete info.params[key];
-			}
-		});
-
+		let saveAttempted = false;
 		let uploadedId: string | null = null;
 		const previousBackground = info.meta.background_image_url;
+		const previousAvatar = structuredClone(info.meta.voice_avatar);
+		const uploadedAvatarIds: string[] = [];
 
 		try {
 			if (backgroundFile) {
@@ -445,31 +525,57 @@
 				uploadedId = uploaded.id;
 				info.meta.background_image_url = `/api/v1/files/${uploaded.id}/content`;
 			}
-			const saved = await onSubmit(info);
-			if (saved === false) throw new Error($i18n.t('Failed to save model'));
-			backgroundFile = null;
-			clearBackgroundPreview();
-		} catch (error: any) {
-			info.meta.background_image_url = previousBackground;
-			if (uploadedId) {
-				// A failed response can follow a committed save; only delete an unused upload.
-				try {
-					const response = await fetch(
-						`${WEBUI_API_BASE_URL}/models/model?${new URLSearchParams({ id: info.id })}`,
-						{ headers: { authorization: `Bearer ${localStorage.token}` } }
+			if (avatarFile && info.meta.voice_avatar) {
+				const uploaded = await uploadFile(localStorage.token, avatarFile, null, false, false);
+				if (!uploaded?.id) throw new Error($i18n.t('Failed to upload avatar.'));
+				uploadedAvatarIds.push(uploaded.id);
+				info.meta.voice_avatar = { ...info.meta.voice_avatar, file_id: uploaded.id };
+			}
+			if (info.meta.voice_avatar) {
+				const avatar = info.meta.voice_avatar;
+				const replacements = new Map<string, string>();
+				for (const id of new Set(avatarAssetIds(avatar))) {
+					if (!animationFiles[id]) continue;
+					const uploaded = await uploadFile(
+						localStorage.token,
+						animationFiles[id],
+						null,
+						false,
+						false
 					);
-					if (
-						response.status === 404 ||
-						(response.ok &&
-							(await response.json())?.meta?.background_image_url !==
-								`/api/v1/files/${uploadedId}/content`)
-					) {
-						await deleteFileById(localStorage.token, uploadedId);
-					}
-				} catch {
-					/* Leave uncertain uploads for file management. */
+					if (!uploaded?.id) throw new Error($i18n.t('Failed to upload animation.'));
+					uploadedAvatarIds.push(uploaded.id);
+					replacements.set(id, uploaded.id);
+				}
+				for (const asset of [...Object.values(avatar.states ?? {}), ...(avatar.gestures ?? [])]) {
+					asset.file_id = replacements.get(asset.file_id) ?? asset.file_id;
 				}
 			}
+			saveAttempted = true;
+			allowNavigation = true;
+			const saved = await onSubmit({ ...info, commit_message: commitMessage || undefined });
+			if (!saved) throw new Error($i18n.t('Failed to save model'));
+			if (typeof saved === 'object') await loadModel(saved);
+			commitMessage = '';
+			backgroundFile = null;
+			avatarFile = null;
+			animationFiles = {};
+			voiceAvatar = info.meta.voice_avatar;
+			clearBackgroundPreview();
+			await tick();
+			savedDraft = JSON.stringify(modelInfo);
+			allowNavigation = false;
+		} catch (error: any) {
+			info.meta.background_image_url = previousBackground;
+			info.meta.voice_avatar = previousAvatar;
+			allowNavigation = false;
+			// A lost response can follow a committed version. Keep its uploads until the outcome is known.
+			if (!saveAttempted) {
+				for (const fileId of [...uploadedAvatarIds, ...(uploadedId ? [uploadedId] : [])]) {
+					await deleteFileById(localStorage.token, fileId).catch(() => {});
+				}
+			}
+
 			toast.error(`${error?.detail ?? error?.message ?? error}`);
 		} finally {
 			loading = false;
@@ -477,38 +583,17 @@
 		}
 	};
 
-	onMount(async () => {
-		languages = await getLanguages();
-		await tools.set((await getTools(localStorage.token).catch(() => null)) ?? []);
-		skillsList = (await getSkills(localStorage.token).catch(() => null)) ?? [];
-		if (!$functions) {
-			await functions.set(await getFunctions(localStorage.token));
-		}
-		if (suggestionTags.length === 0) {
-			await loadSuggestionTags();
-		}
-		if (voices.length === 0) {
-			await loadVoices();
-		}
-
-		// Fetch admin-configured default model metadata so the editor
-		// reflects the actual defaults rather than hardcoded values
-		const modelsConfig = await getModelsDefaults(localStorage.token).catch(() => null);
-		const defaultMeta = modelsConfig?.DEFAULT_MODEL_METADATA ?? {};
-
-		// Use admin defaults as base, falling back to hardcoded defaults
-		capabilities = { ...DEFAULT_CAPABILITIES, ...(defaultMeta.capabilities ?? {}) };
-		defaultFeatureIds = defaultMeta.defaultFeatureIds ?? [];
-		builtinTools = defaultMeta.builtinTools ?? {};
-
-		// Scroll to top 'workspace-container' element
-		const workspaceContainer = document.getElementById('workspace-container');
-		if (workspaceContainer) {
-			workspaceContainer.scrollTop = 0;
-		}
-
+	const loadModel = async (value: any) => {
+		model = value ? structuredClone(value) : null;
+		backgroundFile = null;
+		avatarFile = null;
+		animationFiles = {};
+		commitMessage = '';
+		editingLocale = '';
+		clearBackgroundPreview();
 		if (model) {
 			name = model.name;
+			voiceAvatar = model.meta?.voice_avatar ? structuredClone(model.meta.voice_avatar) : null;
 			await tick();
 
 			id = model.id;
@@ -533,7 +618,7 @@
 
 			system = model?.params?.system ?? '';
 
-			params = { ...params, ...model?.params };
+			params = { system: '', ...model?.params };
 			params.stop = params?.stop
 				? (typeof params.stop === 'string' ? params.stop.split(',') : (params?.stop ?? [])).join(
 						','
@@ -566,37 +651,87 @@
 			actionIds = model?.meta?.actionIds ?? [];
 
 			// Per-model overrides take precedence over admin defaults
-			capabilities = { ...capabilities, ...(model?.meta?.capabilities ?? {}) };
-			defaultFeatureIds = model?.meta?.defaultFeatureIds ?? defaultFeatureIds;
-			builtinTools = model?.meta?.builtinTools ?? builtinTools;
+			capabilities = {
+				...DEFAULT_CAPABILITIES,
+				...(defaultMeta.capabilities ?? {}),
+				...(model?.meta?.capabilities ?? {})
+			};
+			defaultFeatureIds = model?.meta?.defaultFeatureIds ?? defaultMeta.defaultFeatureIds ?? [];
+			builtinTools = model?.meta?.builtinTools ?? defaultMeta.builtinTools ?? {};
 			terminalId = model?.meta?.terminalId ?? '';
 			tts = { voice: model?.meta?.tts?.voice ?? '' };
+			voice = { voice: model?.meta?.voice?.voice ?? '' };
 
 			accessGrants = model?.access_grants ?? [];
 
-			info = {
-				...info,
-				...JSON.parse(
-					JSON.stringify(
-						model
-							? model
-							: {
-									id: model.id,
-									name: model.name
-								}
-					)
-				)
-			};
+			info = structuredClone(model);
 			info.meta.i18n = info.meta.i18n ?? {};
-
-			console.log(model);
 		}
 
+		await tick();
+		savedDraft = JSON.stringify(modelInfo);
+	};
+	const productionHandler = async (value: any) => {
+		await loadModel(value);
+		try {
+			models.set(
+				await getModels(
+					localStorage.token,
+					$config?.features?.enable_direct_connections
+						? ($settings?.directConnections ?? null)
+						: null
+				)
+			);
+		} catch (error) {
+			toast.error(`${error}`);
+		}
+	};
+
+	onMount(async () => {
+		languages = await getLanguages();
+		await tools.set((await getTools(localStorage.token).catch(() => null)) ?? []);
+		skillsList = (await getSkills(localStorage.token).catch(() => null)) ?? [];
+		if (!$functions) {
+			await functions.set(await getFunctions(localStorage.token));
+		}
+		if (suggestionTags.length === 0) {
+			await loadSuggestionTags();
+		}
+		if (voices.length === 0) {
+			await loadVoices();
+		}
+
+		// Fetch admin-configured default model metadata so the editor
+		// reflects the actual defaults rather than hardcoded values
+		const modelsConfig = await getModelsDefaults(localStorage.token).catch(() => null);
+		defaultMeta = modelsConfig?.DEFAULT_MODEL_METADATA ?? {};
+
+		// Use admin defaults as base, falling back to hardcoded defaults
+		capabilities = { ...DEFAULT_CAPABILITIES, ...(defaultMeta.capabilities ?? {}) };
+		defaultFeatureIds = defaultMeta.defaultFeatureIds ?? [];
+		builtinTools = defaultMeta.builtinTools ?? {};
+
+		// Scroll to top 'workspace-container' element
+		const workspaceContainer = document.getElementById('workspace-container');
+		if (workspaceContainer) {
+			workspaceContainer.scrollTop = 0;
+		}
+
+		await loadModel(model);
 		loaded = true;
 	});
 </script>
 
 {#if loaded}
+	<ConfirmDialog
+		bind:show={showDiscard}
+		title={$i18n.t('Discard unsaved changes?')}
+		message={$i18n.t('Your unsaved changes will be lost.')}
+		on:confirm={() => {
+			allowNavigation = true;
+			afterDiscard?.();
+		}}
+	/>
 	<AccessControlModal
 		bind:show={showAccessControlModal}
 		bind:accessGrants
@@ -609,20 +744,75 @@
 	/>
 
 	<div class="flex h-full min-h-0 w-full flex-col">
-		{#if onBack}
-			<button
-				class="mb-1 flex h-6 w-fit items-center gap-1 rounded-md text-xs text-gray-400 transition-colors duration-75 hover:text-gray-700 dark:text-gray-600 dark:hover:text-gray-300"
-				type="button"
-				on:click={() => {
-					onBack();
-				}}
-			>
-				<ChevronLeft className="size-3" strokeWidth="2" />
-				<span>{$i18n.t('Back')}</span>
-			</button>
-		{/if}
+		<div class="flex shrink-0 items-center gap-3">
+			{#if onBack}
+				<button
+					class="flex h-6 w-fit shrink-0 items-center gap-1 whitespace-nowrap rounded-md text-xs text-gray-400 transition-colors duration-75 hover:text-gray-700 dark:text-gray-600 dark:hover:text-gray-300"
+					type="button"
+					on:click={() => {
+						discardThen(() => {
+							allowNavigation = true;
+							onBack?.();
+						});
+					}}
+				>
+					<ChevronLeft className="size-3" strokeWidth="2" />
+					<span>{$i18n.t('Back')}</span>
+				</button>
+			{/if}
+			{#if edit && model?.version_id && !readOnly}
+				<ModelHistory
+					bind:this={historyMenu}
+					{model}
+					{dirty}
+					bind:selected={selectedVersion}
+					bind:selecting={selectingVersion}
+					bind:promoting={promotingVersion}
+					onProduction={productionHandler}
+				/>
+			{/if}
+			{#if !historical && !readOnly}
+				<div class="ms-auto flex shrink-0 items-center gap-1 pr-0.5">
+					<LanguageModeSelect
+						bind:value={editingLocale}
+						{languages}
+						{translatedLocales}
+						className="w-fit"
+					/>
+					<AccessButton on:click={() => (showAccessControlModal = true)} />
+				</div>
+			{/if}
+		</div>
 
-		<div class="min-h-0 w-full flex-1 overflow-y-auto pr-1 scrollbar-hover">
+		{#if selectingVersion}
+			<div class="flex flex-1 justify-center py-8"><Spinner className="size-5" /></div>
+		{:else if selectedVersion}
+			<section aria-label={$i18n.t('Model version preview')} class="min-h-0 flex-1">
+				{#key selectedVersion.id}
+					<svelte:self
+						model={{ id: model.id, ...selectedVersion.snapshot }}
+						edit
+						readOnly
+						{admin}
+						preset={!!selectedVersion.snapshot.base_model_id}
+					/>
+				{/key}
+			</section>
+			<div class="flex shrink-0 justify-end px-1 py-2">
+				<button
+					type="button"
+					class="flex h-7 items-center gap-1.5 rounded-lg bg-gray-900 px-2.5 text-xs text-white transition hover:bg-black disabled:opacity-60 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+					disabled={promotingVersion}
+					on:click={() => historyMenu.requestPromotion()}
+				>
+					{$i18n.t('Set as Production')}
+				</button>
+			</div>
+		{/if}
+		<div
+			class:hidden={historical}
+			class="min-h-0 w-full flex-1 overflow-y-auto pr-1 scrollbar-hover"
+		>
 			<input
 				bind:this={filesInputElement}
 				bind:files={inputFiles}
@@ -701,14 +891,18 @@
 			/>
 
 			{#if !edit || (edit && model)}
+				<!-- svelte-ignore a11y_no_noninteractive_element_interactions (Capture listeners block changes from custom controls in read-only fieldsets.) -->
 				<form
 					class="flex w-full flex-col gap-2.5 md:flex-row"
+					on:click|capture={preventReadOnlyEdit}
+					on:keydown|capture={preventReadOnlyEdit}
+					on:pointerdown|capture={preventReadOnlyEdit}
 					on:submit|preventDefault={() => {
 						submitHandler();
 					}}
 				>
 					<div class="w-full px-1">
-						<div class="flex w-full flex-col gap-3">
+						<fieldset disabled={readOnly} class="flex min-w-0 w-full flex-col gap-3">
 							<div class="flex w-full min-w-0 items-center gap-3 py-0.5">
 								<div class="flex min-w-0 flex-1 items-center gap-3">
 									<!-- LICENSE covers this Open WebUI fallback logo.
@@ -799,19 +993,6 @@
 													required
 												/>
 											{/if}
-
-											<LanguageModeSelect
-												bind:value={editingLocale}
-												{languages}
-												{translatedLocales}
-												className="hidden w-fit sm:inline-flex"
-											/>
-
-											<AccessButton
-												on:click={() => {
-													showAccessControlModal = true;
-												}}
-											/>
 										</div>
 
 										{#if editingLocale}
@@ -838,14 +1019,6 @@
 											disabled={edit}
 											required
 										/>
-
-										<div class="mt-1 sm:hidden">
-											<LanguageModeSelect
-												bind:value={editingLocale}
-												{languages}
-												{translatedLocales}
-											/>
-										</div>
 									</div>
 								</div>
 							</div>
@@ -1042,7 +1215,7 @@
 									}}
 								/>
 							</div>
-						</div>
+						</fieldset>
 
 						<section class="mt-2.5">
 							<div class="mb-2 text-xs text-gray-400 dark:text-gray-600">
@@ -1050,7 +1223,7 @@
 							</div>
 
 							<div class="space-y-2.5">
-								<div>
+								<fieldset disabled={readOnly} class="min-w-0">
 									<div class="mb-1 text-xs text-gray-600 dark:text-gray-400">
 										{$i18n.t('System Prompt')}
 									</div>
@@ -1120,7 +1293,7 @@
 											{/if}
 										</div>
 									{/if}
-								</div>
+								</fieldset>
 
 								<div class="flex h-7 w-full justify-between">
 									<div class="self-center text-xs text-gray-600 dark:text-gray-400">
@@ -1143,201 +1316,258 @@
 								</div>
 
 								{#if showAdvanced}
-									<div class="my-2">
+									<fieldset disabled={readOnly} class="min-w-0 my-2">
 										<AdvancedParams admin={true} custom={true} layout="grid" bind:params />
+									</fieldset>
+								{/if}
+								{#if admin}
+									<fieldset disabled={readOnly} class="min-w-0">
+										<ModelControls bind:controls={params.model_controls} />
+									</fieldset>
+								{/if}
+							</div>
+						</section>
+
+						<fieldset disabled={readOnly} class="min-w-0">
+							<hr class=" border-gray-100/30 dark:border-gray-850/30 my-2" />
+
+							<section class="my-2.5">
+								<div class="flex w-full items-center justify-between">
+									<div class="self-center text-xs text-gray-400 dark:text-gray-600">
+										{$i18n.t('Prompts')}
 									</div>
-								{/if}
-							</div>
-						</section>
 
-						<hr class=" border-gray-100/30 dark:border-gray-850/30 my-2" />
-
-						<section class="my-2.5">
-							<div class="flex w-full items-center justify-between">
-								<div class="self-center text-xs text-gray-400 dark:text-gray-600">
-									{$i18n.t('Prompts')}
+									{#if !editingLocale}
+										<button
+											class="text-xs text-gray-500 transition hover:text-gray-700 dark:hover:text-gray-300"
+											type="button"
+											on:click={() => {
+												if ((info?.meta?.suggestion_prompts ?? null) === null) {
+													info.meta.suggestion_prompts = [{ content: '', title: ['', ''] }];
+												} else {
+													info.meta.suggestion_prompts = null;
+												}
+											}}
+										>
+											{#if (info?.meta?.suggestion_prompts ?? null) === null}
+												<span>{$i18n.t('Default')}</span>
+											{:else}
+												<span>{$i18n.t('Custom')}</span>
+											{/if}
+										</button>
+									{/if}
 								</div>
 
-								{#if !editingLocale}
-									<button
-										class="text-xs text-gray-500 transition hover:text-gray-700 dark:hover:text-gray-300"
-										type="button"
-										on:click={() => {
-											if ((info?.meta?.suggestion_prompts ?? null) === null) {
-												info.meta.suggestion_prompts = [{ content: '', title: ['', ''] }];
-											} else {
-												info.meta.suggestion_prompts = null;
-											}
-										}}
-									>
-										{#if (info?.meta?.suggestion_prompts ?? null) === null}
-											<span>{$i18n.t('Default')}</span>
-										{:else}
-											<span>{$i18n.t('Custom')}</span>
-										{/if}
-									</button>
-								{/if}
-							</div>
-
-							{#if editingLocale}
-								<LocalizedPromptSuggestions
-									promptSuggestions={info.meta.suggestion_prompts ?? []}
-									bind:localizedPromptSuggestions={info.meta.i18n}
-									locale={editingLocale}
-									localeLabel={editingLocaleLabel}
-								/>
-							{:else if info?.meta?.suggestion_prompts}
-								<PromptSuggestions bind:promptSuggestions={info.meta.suggestion_prompts} />
-							{/if}
-						</section>
-
-						<div class="my-3">
-							<Knowledge bind:selectedItems={knowledge} />
-						</div>
-
-						<div class="my-3">
-							<ToolsSelector bind:selectedToolIds={toolIds} tools={$tools ?? []} />
-						</div>
-
-						<div class="my-3">
-							<SkillsSelector bind:selectedSkillIds={skillIds} skills={skillsList} />
-						</div>
-
-						{#if ($functions ?? []).filter((func) => func.type === 'filter').length > 0 || ($functions ?? []).filter((func) => func.type === 'action').length > 0}
-							<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
-
-							{#if ($functions ?? []).filter((func) => func.type === 'filter').length > 0}
-								<div class="my-3">
-									<FiltersSelector
-										bind:selectedFilterIds={filterIds}
-										filters={($functions ?? []).filter((func) => func.type === 'filter')}
+								{#if editingLocale}
+									<LocalizedPromptSuggestions
+										promptSuggestions={info.meta.suggestion_prompts ?? []}
+										bind:localizedPromptSuggestions={info.meta.i18n}
+										locale={editingLocale}
+										localeLabel={editingLocaleLabel}
 									/>
-								</div>
+								{:else if info?.meta?.suggestion_prompts}
+									<PromptSuggestions bind:promptSuggestions={info.meta.suggestion_prompts} />
+								{/if}
+							</section>
 
-								{@const toggleableFilters = $functions.filter(
-									(func) =>
-										func.type === 'filter' &&
-										(filterIds.includes(func.id) || func?.is_global) &&
-										func?.meta?.toggle
-								)}
+							<div class="my-3">
+								<Knowledge bind:selectedItems={knowledge} />
+							</div>
 
-								{#if toggleableFilters.length > 0}
+							<div class="my-3">
+								<ToolsSelector bind:selectedToolIds={toolIds} tools={$tools ?? []} />
+							</div>
+
+							<div class="my-3">
+								<SkillsSelector bind:selectedSkillIds={skillIds} skills={skillsList} />
+							</div>
+
+							{#if ($functions ?? []).filter((func) => func.type === 'filter').length > 0 || ($functions ?? []).filter((func) => func.type === 'action').length > 0}
+								<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
+
+								{#if ($functions ?? []).filter((func) => func.type === 'filter').length > 0}
 									<div class="my-3">
-										<DefaultFiltersSelector
-											bind:selectedFilterIds={defaultFilterIds}
-											filters={toggleableFilters}
+										<FiltersSelector
+											bind:selectedFilterIds={filterIds}
+											filters={($functions ?? []).filter((func) => func.type === 'filter')}
+										/>
+									</div>
+
+									{@const toggleableFilters = $functions.filter(
+										(func) =>
+											func.type === 'filter' &&
+											(filterIds.includes(func.id) || func?.is_global) &&
+											func?.meta?.toggle
+									)}
+
+									{#if toggleableFilters.length > 0}
+										<div class="my-3">
+											<DefaultFiltersSelector
+												bind:selectedFilterIds={defaultFilterIds}
+												filters={toggleableFilters}
+											/>
+										</div>
+									{/if}
+								{/if}
+
+								{#if ($functions ?? []).filter((func) => func.type === 'action').length > 0}
+									<div class="my-3">
+										<ActionsSelector
+											bind:selectedActionIds={actionIds}
+											actions={($functions ?? []).filter((func) => func.type === 'action')}
 										/>
 									</div>
 								{/if}
 							{/if}
 
-							{#if ($functions ?? []).filter((func) => func.type === 'action').length > 0}
+							<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
+
+							<div class="my-3">
+								<Capabilities bind:capabilities />
+							</div>
+
+							{#if Object.keys(capabilities).filter((key) => capabilities[key]).length > 0}
+								{@const availableFeatures = Object.entries(capabilities)
+									.filter(
+										([key, value]) =>
+											value && ['web_search', 'code_interpreter', 'image_generation'].includes(key)
+									)
+									.map(([key, value]) => key)}
+
+								{#if availableFeatures.length > 0}
+									<div class="my-3">
+										<DefaultFeatures {availableFeatures} bind:featureIds={defaultFeatureIds} />
+									</div>
+								{/if}
+							{/if}
+
+							{#if capabilities.builtin_tools}
 								<div class="my-3">
-									<ActionsSelector
-										bind:selectedActionIds={actionIds}
-										actions={($functions ?? []).filter((func) => func.type === 'action')}
+									<BuiltinTools bind:builtinTools />
+								</div>
+							{/if}
+
+							{#if capabilities.terminal}
+								<div class="my-3">
+									<TerminalSelector bind:terminalId />
+								</div>
+							{/if}
+
+							{#if $config?.audio?.realtime?.enabled}
+								<div class="my-3">
+									<div class="flex w-full justify-between mb-1">
+										<label
+											for="realtime-voice-input"
+											class="self-center text-xs font-normal text-gray-500"
+										>
+											{$i18n.t('Realtime Voice')}
+										</label>
+									</div>
+									<TTSVoiceInput
+										id="realtime-voice"
+										bind:value={voice.voice}
+										placeholder={$i18n.t('Admin default')}
 									/>
 								</div>
 							{/if}
-						{/if}
-
-						<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
-
-						<div class="my-3">
-							<Capabilities bind:capabilities />
-						</div>
-
-						{#if Object.keys(capabilities).filter((key) => capabilities[key]).length > 0}
-							{@const availableFeatures = Object.entries(capabilities)
-								.filter(
-									([key, value]) =>
-										value && ['web_search', 'code_interpreter', 'image_generation'].includes(key)
-								)
-								.map(([key, value]) => key)}
-
-							{#if availableFeatures.length > 0}
-								<div class="my-3">
-									<DefaultFeatures {availableFeatures} bind:featureIds={defaultFeatureIds} />
-								</div>
+							{#if $config?.audio?.realtime?.enabled || voiceAvatar}
+								<VoiceAvatarSettings
+									bind:value={voiceAvatar}
+									bind:file={avatarFile}
+									bind:animationFiles
+									disabled={loading}
+								/>
 							{/if}
-						{/if}
-
-						{#if capabilities.builtin_tools}
 							<div class="my-3">
-								<BuiltinTools bind:builtinTools />
-							</div>
-						{/if}
-
-						{#if capabilities.terminal}
-							<div class="my-3">
-								<TerminalSelector bind:terminalId />
-							</div>
-						{/if}
-
-						<div class="my-3">
-							<div class="flex w-full justify-between mb-1">
-								<div class="self-center text-xs font-normal text-gray-500">
-									{$i18n.t('TTS Voice')}
+								<div class="flex w-full justify-between mb-1">
+									<div class="self-center text-xs font-normal text-gray-500">
+										{$i18n.t('TTS Voice')}
+									</div>
 								</div>
+								<TTSVoiceInput
+									bind:value={tts.voice}
+									{voices}
+									placeholder={$i18n.t('e.g. alloy, echo, shimmer')}
+								/>
 							</div>
-							<TTSVoiceInput
-								bind:value={tts.voice}
-								{voices}
-								placeholder={$i18n.t('e.g. alloy, echo, shimmer')}
-							/>
-						</div>
+						</fieldset>
 
 						<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
 
-						<div class="my-2 flex justify-end">
-							<button
-								class=" text-sm px-3 py-2 transition rounded-lg {loading
-									? ' cursor-not-allowed bg-black hover:bg-gray-900 text-white dark:bg-white dark:hover:bg-gray-100 dark:text-black'
-									: 'bg-black hover:bg-gray-900 text-white dark:bg-white dark:hover:bg-gray-100 dark:text-black'} flex w-full justify-center"
-								type="submit"
-								disabled={loading}
-							>
-								<div class=" self-center font-normal">
-									{#if edit}
-										{$i18n.t('Save & Update')}
-									{:else}
-										{$i18n.t('Save & Create')}
-									{/if}
-								</div>
-
-								{#if loading}
-									<div class="ml-1.5 self-center">
-										<Spinner />
-									</div>
+						{#if !readOnly}
+							<div class="my-2 flex items-center justify-end gap-2">
+								{#if edit}
+									<input
+										type="text"
+										aria-label={$i18n.t('Commit message')}
+										placeholder={$i18n.t('Describe this change')}
+										class="min-w-0 flex-1 border-0 bg-transparent px-1 text-xs outline-hidden focus:ring-0"
+										bind:value={commitMessage}
+									/>
 								{/if}
-							</button>
-						</div>
-
-						<div class="my-2 text-gray-300 dark:text-gray-700 pb-20">
-							<div class="flex w-full justify-between mb-2">
-								<div class=" self-center text-sm font-normal">{$i18n.t('JSON Preview')}</div>
-
 								<button
-									class="p-1 px-3 text-xs flex rounded-sm transition"
-									type="button"
-									on:click={() => {
-										showPreview = !showPreview;
-									}}
+									class="flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-lg bg-gray-900 px-2.5 text-xs text-white transition hover:bg-black disabled:opacity-60 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+									type="submit"
+									disabled={loading || (edit && !configurationChanged)}
 								>
-									{#if showPreview}
-										<span class="ml-2 self-center">{$i18n.t('Hide')}</span>
-									{:else}
-										<span class="ml-2 self-center">{$i18n.t('Show')}</span>
+									<div class=" self-center font-normal">
+										{#if edit}
+											{$i18n.t('Save & Update')}
+										{:else}
+											{$i18n.t('Save & Create')}
+										{/if}
+									</div>
+
+									{#if loading}
+										<div class="ml-1.5 self-center">
+											<Spinner />
+										</div>
 									{/if}
 								</button>
+							</div>
+						{/if}
+
+						<div class="my-2 pb-2 text-xs text-gray-400 dark:text-gray-500">
+							<div class="flex w-full justify-between mb-2">
+								<div class="self-center text-xs font-normal">{$i18n.t('JSON Preview')}</div>
+
+								<div class="flex items-center">
+									<button
+										class="px-1.5 py-0.5 text-xs flex rounded-sm transition"
+										type="button"
+										on:click={async () => {
+											const copied = await copyToClipboard(
+												JSON.stringify(readOnly ? model : modelInfo, null, 2)
+											);
+											if (copied) {
+												toast.success($i18n.t('Copied to clipboard'));
+											}
+										}}
+									>
+										{$i18n.t('Copy')}
+									</button>
+									<button
+										class="px-1.5 py-0.5 text-xs flex rounded-sm transition"
+										type="button"
+										on:click={() => {
+											showPreview = !showPreview;
+										}}
+									>
+										{#if showPreview}
+											<span class="self-center">{$i18n.t('Hide')}</span>
+										{:else}
+											<span class="self-center">{$i18n.t('Show')}</span>
+										{/if}
+									</button>
+								</div>
 							</div>
 
 							{#if showPreview}
 								<div>
 									<textarea
-										class="text-sm w-full bg-transparent outline-hidden resize-none"
-										rows="10"
-										value={JSON.stringify(info, null, 2)}
+										class="w-full bg-transparent text-xs leading-5 outline-hidden resize-none"
+										rows="8"
+										value={JSON.stringify(readOnly ? model : modelInfo, null, 2)}
 										disabled
 										readonly
 									/>
